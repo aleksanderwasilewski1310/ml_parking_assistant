@@ -29,7 +29,7 @@ import pyspark.sql.functions as F
 from read_data import create_dataframe
 from train_model import ParkingModelTrainer
 # pylint: enable=import-error
-# pylint: disable=broad-exception-caught
+# pylint: disable=broad-except
 
 # --- Logging Configuration ---
 logging.basicConfig(
