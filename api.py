@@ -9,6 +9,7 @@ Key improvements over legacy implementations:
   - Auto-generated interactive docs available out-of-the-box at /docs (Swagger UI).
 """
 
+# pylint: disable=import-error
 import os
 import sys
 import logging
@@ -27,6 +28,7 @@ import pyspark.sql.functions as F
 
 from read_data import create_dataframe
 from train_model import ParkingModelTrainer
+# pylint: enable=import-error
 
 # ---------------------------------------------------------------------------
 # LOGGING SYSTEM CONFIGURATION
@@ -39,7 +41,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger("VW-Parking-API")
 
 # Global reference wrapper for the SparkSession engine
-spark: Optional[SparkSession] = None
+SPARK: Optional[SparkSession] = None
 
 # ---------------------------------------------------------------------------
 # CONSTANTS & CONFIGURATION
@@ -212,7 +214,7 @@ async def lifespan(app: FastAPI):
     Enforces python execution path parity for secondary PySpark context allocation workers.
     """
     # -- STARTUP SEQUENCE ----------------------------------------------------
-    global spark
+    global SPARK
     LOGGER.info(
         "Warming local operating kernel context. Building PySpark Session context..."
     )
@@ -221,7 +223,7 @@ async def lifespan(app: FastAPI):
     os.environ["PYSPARK_PYTHON"] = sys.executable
     os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
-    spark = (
+    SPARK = (
         SparkSession.builder.appName("VW_SmartParking_API")
         .config("spark.driver.memory", "4g")
         .config(
@@ -265,8 +267,8 @@ async def lifespan(app: FastAPI):
     global _HISTORICAL_PROFILES
     if _HISTORICAL_PROFILES is not None:
         _HISTORICAL_PROFILES.unpersist()
-    if spark:
-        spark.stop()
+    if SPARK:
+        SPARK.stop()
     LOGGER.info("API cluster termination processes successfully closed down.")
 
 
@@ -311,6 +313,7 @@ def health() -> HealthResponse:
     )
 
 
+# pylint: disable=too-many-local-variables
 @app.post(
     "/predict",
     response_model=PredictionResponse,
@@ -323,14 +326,14 @@ def predict(request: PredictionRequest) -> PredictionResponse:
     Evaluates localized node arrays to output optimized vacancy indexes.
     """
     # 1. Temporal extraction execution over validated payload attributes
-    ts = request.timestamp
-    hour = ts.hour
-    day_of_week = ts.isoweekday()  # Monday=1 ... Sunday=7 layout
-    month = ts.month
+    time_stamp = request.timestamp
+    hour = time_stamp.hour
+    day_of_week = time_stamp.isoweekday()  # Monday=1 ... Sunday=7 layout
+    month = time_stamp.month
 
     LOGGER.info(
         f"""Prediction demand | Target Node: {request.road_segment_id} |
-          Temporal marker: {ts.isoformat()} """
+          Temporal marker: {time_stamp.isoformat()} """
         f"""| Routing depth criteria: {request.driver_profile} |
           Context metrics: H:{hour} DOW:{day_of_week} M:{month}"""
     )
@@ -351,7 +354,7 @@ def predict(request: PredictionRequest) -> PredictionResponse:
 
         inference_df: DataFrame = (
             all_segments_df.withColumn(
-                "timestamp", F.lit(ts.isoformat()).cast("timestamp")
+                "timestamp", F.lit(time_stamp.isoformat()).cast("timestamp")
             )
             .withColumn("hour", F.lit(hour))
             .withColumn("day_of_week", F.lit(day_of_week))
@@ -391,7 +394,8 @@ def predict(request: PredictionRequest) -> PredictionResponse:
         if not target_rows:
             raise HTTPException(
                 status_code=404,
-                detail=f"Specified location entity '{request.road_segment_id}' is unknown inside matrix models.",
+                detail=f"""Specified location entity '{request.road_segment_id}'
+                  is unknown inside matrix models.""",
             )
 
         target_probability = round(float(target_rows[0]["occupancy_probability"]), 4)
@@ -402,7 +406,8 @@ def predict(request: PredictionRequest) -> PredictionResponse:
         if request.driver_profile in (DriverProfile.active, DriverProfile.standard):
             top_n = 10 if request.driver_profile == DriverProfile.active else 5
 
-            # Rank candidate entities based on relative vacancy (lowest saturation maps optimal status)
+            # Rank candidate entities based on relative vacancy
+            #  (lowest saturation maps optimal status)
             alt_rows = (
                 results_df.filter(F.col("road_segment_id") != request.road_segment_id)
                 .orderBy(F.col("occupancy_probability").asc())

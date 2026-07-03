@@ -1,26 +1,29 @@
 """Module for reading, cleaning, and merging data for the VW Smart Parking project."""
 
+# pylint: disable=import-error
 import logging
 from pyspark.sql import SparkSession
 from pyspark.sql.dataframe import DataFrame
 from pyspark.errors import AnalysisException
+# pylint: enable=import-error
 
 # Java modular architecture access flags required for PySpark arrow / memory compliance
-java_opens_flags = (
+JAVA_OPENS_FLAGS = (
     "--add-opens=java.base/javax.security.auth=ALL-UNNAMED "
     "--add-opens=java.base/java.lang=ALL-UNNAMED"
 )
 
 # Initialize the Spark Session with memory and Java compliance configurations
-spark = (
+SPARK = (
     SparkSession.builder.appName("VW_SmartParking")
     .config("spark.driver.memory", "4g")
-    .config("spark.driver.extraJavaOptions", java_opens_flags)
-    .config("spark.executor.extraJavaOptions", java_opens_flags)
+    .config("spark.driver.extraJavaOptions", JAVA_OPENS_FLAGS)
+    .config("spark.executor.extraJavaOptions", JAVA_OPENS_FLAGS)
     .getOrCreate()
 )
 
 
+# pylint: disable=too-few-public-methods
 class ReadFile:
     """A data extraction and staging abstraction layer for source data files.
 
@@ -42,7 +45,7 @@ class ReadFile:
         try:
             logger.info(f"Attempting to load file: {path}")
             # Load CSV data
-            self.data = spark.read.csv(
+            self.data = SPARK.read.csv(
                 path, header=True, inferSchema=True, nullValue="null"
             )
 

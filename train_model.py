@@ -3,6 +3,7 @@
 with Historical Target Encoding for the VW Smart Parking dataset.
 """
 
+# pylint: disable=import-error
 import logging
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import VectorAssembler
@@ -11,6 +12,7 @@ from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.functions import vector_to_array
 import pyspark.sql.functions as F
 from pyspark.sql.dataframe import DataFrame
+# pylint: enable=import-error
 
 
 class ParkingModelTrainer:
@@ -93,7 +95,7 @@ class ParkingModelTrainer:
         self.is_trained = True
         logger.info("Random Forest model training completed successfully.")
 
-    def evaluate_model(self, test_df: DataFrame, logger: logging.Logger) -> float:
+    def evaluate_model(self, test_df: DataFrame) -> float:
         """Evaluates the Random Forest model on test data using ROC AUC metric."""
         if not self.is_trained:
             raise ValueError("Model must be trained before evaluation.")
@@ -234,7 +236,7 @@ def train_and_predict_pipeline(
     trainer.get_feature_importance(logger)
 
     # 7. Print auc metric
-    auc = trainer.evaluate_model(test_data, logger)
+    auc = trainer.evaluate_model(test_data)
     logger.info(f"Random Forest Evaluation - Test Set ROC AUC: {auc:.4f}")
 
     # 8. Generate forecasts
