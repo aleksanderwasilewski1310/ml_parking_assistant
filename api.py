@@ -1,5 +1,4 @@
-"""
-api.py — FastAPI REST API for the VW Smart Parking Assistant.
+"""api.py — FastAPI REST API for the VW Smart Parking Assistant.
 
 Key improvements over legacy implementations:
   - Full Pydantic V2 alignment (using modern 'examples' list mapping).
@@ -17,22 +16,21 @@ import threading
 from contextlib import asynccontextmanager  # pylint: disable=no-name-in-module
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from pyspark.sql import SparkSession
 from pyspark.sql.dataframe import DataFrame
+from pyspark.errors import AnalysisException
 import pyspark.sql.functions as F
 
 from read_data import create_dataframe
 from train_model import ParkingModelTrainer
 # pylint: enable=import-error
 
-# ---------------------------------------------------------------------------
-# LOGGING SYSTEM CONFIGURATION
-# ---------------------------------------------------------------------------
+# --- Logging Configuration ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -40,36 +38,31 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger("VW-Parking-API")
 
-# Global reference wrapper for the SparkSession engine
-SPARK: Optional[SparkSession] = None
-
-# ---------------------------------------------------------------------------
-# CONSTANTS & CONFIGURATION
-# ---------------------------------------------------------------------------
-DATA_PATHS: dict = {
+# --- Constants & Configuration ---
+DATA_PATHS: Dict[str, str] = {
     "groundtruth": "groundtruth.csv",
     "road_features": "road_features.csv",
     "weather_features": "weather_features.csv",
 }
 
-# In-memory synchronization timer configuration (1 hour cycle)
 RETRAIN_INTERVAL_SECONDS: int = 3600
 
-# ---------------------------------------------------------------------------
-# DATA VALIDATION SCHEMAS (Pydantic V2 Compliant)
-# ---------------------------------------------------------------------------
+# --- Thread-Safe Global Environment State ---
+MODEL_LOCK = threading.Lock()
+TRAINER_INSTANCE: Optional[ParkingModelTrainer] = None
+HISTORICAL_PROF: Optional[DataFrame] = None
+LAST_TRAINED_AT: Optional[datetime] = None
 
 
-# pylint: disable=too-few-public-methods
+# --- Data Validation Schemas (Pydantic V2) ---
 class DriverProfile(str, Enum):
     """Supported telemetry routing depth criteria profiles."""
 
-    active = "active"
-    standard = "standard"
-    inactive = "inactive"
+    ACTIVE = "active"
+    STANDARD = "standard"
+    INACTIVE = "inactive"
 
 
-# pylint: disable=too-few-public-methods
 class PredictionRequest(BaseModel):
     """Inbound telemetry request blueprint with structural JSON validation."""
 
@@ -84,12 +77,11 @@ class PredictionRequest(BaseModel):
         examples=["2026-07-03T15:30:00"],
     )
     driver_profile: DriverProfile = Field(
-        default=DriverProfile.inactive,
+        default=DriverProfile.INACTIVE,
         description="Driver persona parameter dictating routing search criteria depth.",
     )
 
 
-# pylint: disable=too-few-public-methods
 class AlternativeSegment(BaseModel):
     """A granular alternative parking node prediction matrix output."""
 
@@ -97,7 +89,6 @@ class AlternativeSegment(BaseModel):
     occupancy_probability: float
 
 
-# pylint: disable=too-few-public-methods
 class PredictionResponse(BaseModel):
     """Outbound prediction response contract transmitted back to client nodes."""
 
@@ -110,12 +101,10 @@ class PredictionResponse(BaseModel):
     )
     top_alternatives: Optional[List[AlternativeSegment]] = Field(
         default=None,
-        description="""Ranked list of contextually optimized alternatives
-          (active: top 10, standard: top 5).""",
+        description="Ranked list of contextually optimized alternatives.",
     )
 
 
-# pylint: disable=too-few-public-methods
 class HealthResponse(BaseModel):
     """Monitoring schema mapping the infrastructure vital components."""
 
@@ -124,47 +113,31 @@ class HealthResponse(BaseModel):
     last_trained_at_utc: Optional[str]
 
 
-# ---------------------------------------------------------------------------
-# THREAD-SAFE GLOBAL IN-MEMORY ENVIRONMENT STATE
-# ---------------------------------------------------------------------------
-MODEL_LOCK = threading.Lock()
-trainer_instance: Optional[ParkingModelTrainer] = None
-historical_prof: Optional[DataFrame] = None
-last_trained_at: Optional[datetime] = None
-
-# ---------------------------------------------------------------------------
-# MODEL PIPELINE PROCESSING CORE
-# ---------------------------------------------------------------------------
-
-
+# --- Model Pipeline Processing Core ---
 def _load_and_train() -> None:
-    """Reads transactional analytics data, constructs features, evaluates
+    """Reads transactional data, constructs features, and fits ML pipelines.
 
-    target encodings, fits pipelines, and executes hot-swaps under atomic guards.
+    Uses safe global synchronization primitives to update active runtime variables.
     """
+    global TRAINER_INSTANCE, HISTORICAL_PROF, LAST_TRAINED_AT
 
     LOGGER.info("Initiating model training loop and temporal matrix generation...")
 
     try:
-        # 1. Join file system data inputs into an analytical Spark DataFrame
         df_data: DataFrame = create_dataframe(DATA_PATHS, LOGGER)
 
-        # 2. Extract analytical engineering signatures and construct target classification vectors
         trainer = ParkingModelTrainer()
         base_df = trainer.prepare_features(df_data).withColumn(
             "is_occupied", F.when(F.col("available") == 0, 1).otherwise(0)
         )
 
-        # 3. Rigid division segment to prevent data leak vectors during structural encoding
         raw_train, _ = base_df.randomSplit([0.8, 0.2], seed=42)
 
-        # 4. Compute target ratio arrays (Topological Entity + Hour Coordinates + Weekday)
         historical_profiles: DataFrame = raw_train.groupBy(
             "road_segment_id", "hour", "day_of_week"
         ).agg(F.avg("is_occupied").alias("historical_occupancy_ratio"))
         historical_profiles.cache()
 
-        # 5. Enrich dataset parameters and calibrate active ML Estimator classes
         train_data = raw_train.join(
             historical_profiles,
             on=["road_segment_id", "hour", "day_of_week"],
@@ -173,58 +146,46 @@ def _load_and_train() -> None:
         trainer.build_and_train_pipeline(train_data, LOGGER)
         trainer.get_feature_importance(LOGGER)
 
-        # 6. Secure critical resource execution via single thread-bound context block
         with MODEL_LOCK:
-            trainer_instance = trainer
-            historical_prof = historical_profiles
-            last_trained_at = datetime.now(timezone.utc)
+            TRAINER_INSTANCE = trainer
+            HISTORICAL_PROF = historical_profiles
+            LAST_TRAINED_AT = datetime.now(timezone.utc)
+
+            is_empty = HISTORICAL_PROF.isEmpty() if HISTORICAL_PROF else True
             LOGGER.info(
                 "Thread-bound context updated safely. Trainer object: %s | "
-                "Loaded historical profiles count: %s | Timestamp: %s",
-                type(trainer_instance).__name__,
-                len(historical_prof) if historical_prof else 0,
-                last_trained_at.isoformat(),
+                "Profiles loaded successfully: %s | Timestamp: %s",
+                type(TRAINER_INSTANCE).__name__,
+                "NO (Empty)" if is_empty else "YES (Active)",
+                LAST_TRAINED_AT.isoformat(),
             )
 
-        LOGGER.info("Model update successfully executed at %s", last_trained_at.isoformat())
-
+    except AnalysisException as spark_exc:
+        LOGGER.error("Spark engine calculation failed: %s", spark_exc, exc_info=True)
+    except OSError as io_exc:
+        LOGGER.error("File system reading or caching breakdown: %s", io_exc, exc_info=True)
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        LOGGER.error(
-            "Execution failed on background context assembly pipeline: %s",
-            exc,
-            exc_info=True,
-        )
+        LOGGER.error("Unexpected failure in pipeline execution: %s", exc, exc_info=True)
 
 
 def _schedule_retraining() -> None:
-    """Cyclical worker task block looping context routines over standard intervals."""
+    """Cyclical worker task loop checking routines over standard intervals."""
     LOGGER.info(
-        "Asynchronous batch daemon online — standard checking pattern: %ss",
+        "Asynchronous batch daemon online checking pattern: %ss",
         RETRAIN_INTERVAL_SECONDS,
     )
     stop_event = threading.Event()
     while not stop_event.wait(timeout=RETRAIN_INTERVAL_SECONDS):
-        LOGGER.info(
-            "Timed interval interrupt detected. Triggering background pipeline update loop..."
-        )
+        LOGGER.info("Timed interval interrupt detected. Triggering background pipeline update...")
         _load_and_train()
 
 
-# ---------------------------------------------------------------------------
-# FASTAPI LIFECYCLE MANAGEMENT (LIFESPAN COORD)
-# ---------------------------------------------------------------------------
-
-
+# --- FastAPI Lifecycle Management ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Coordinates explicit infrastructure boots and deterministic system teardowns.
-
-    Enforces python execution path parity for secondary PySpark context allocation workers.
-    """
-    # -- STARTUP SEQUENCE ----------------------------------------------------
+    """Coordinates explicit infrastructure boots and deterministic system teardowns."""
     LOGGER.info("Warming local operating kernel context. Building PySpark Session context...")
 
-    # WINDOWS ENVIRONMENT STABILITY CURE: Enforce workers to bind to virtual env paths explicitly
     os.environ["PYSPARK_PYTHON"] = sys.executable
     os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
@@ -247,10 +208,8 @@ async def lifespan(app: FastAPI):
     LOGGER.info("Pre-warming model analytics arrays prior to interface exposing...")
     _load_and_train()
 
-    if trainer_instance is None:
-        LOGGER.critical(
-            "Initial training sequence collapsed. Service framework cannot boot securely."
-        )
+    if TRAINER_INSTANCE is None:
+        LOGGER.critical("Initial training sequence collapsed. Secure boot failed.")
         raise RuntimeError("Prerequisite component building crashed during startup layer.")
 
     retrainer_thread = threading.Thread(
@@ -261,34 +220,25 @@ async def lifespan(app: FastAPI):
     retrainer_thread.start()
     LOGGER.info("Subprocess daemon 'ModelRetrainer' safely assigned to execution queue.")
 
-    yield  # Handover execution control back to web engine context loop
+    yield
 
-    # -- SHUTDOWN SEQUENCE ---------------------------------------------------
     LOGGER.info("Intercepted teardown invocation. Disengaging cluster engine links...")
-
-    if historical_prof is not None:
-        historical_prof.unpersist()
+    if HISTORICAL_PROF is not None:
+        HISTORICAL_PROF.unpersist()
     if app.state.spark:
         app.state.spark.stop()
     LOGGER.info("API cluster termination processes successfully closed down.")
 
 
-# Instantiating high-performance engine blueprint
 APP = FastAPI(
     title="VW Smart Parking Assistant API",
-    description=(
-        "Predicts parking availability for a given road segment and timestamp. "
-        "Supports three driver profiles: active, standard, and inactive."
-    ),
+    description="Predicts parking availability for a given road segment and timestamp.",
     version="2.0.0",
     lifespan=lifespan,
 )
 
-# ---------------------------------------------------------------------------
-# REST ENDPOINTS LAYER
-# ---------------------------------------------------------------------------
 
-
+# --- REST Endpoints Layer ---
 @APP.get(
     "/health",
     response_model=HealthResponse,
@@ -298,8 +248,8 @@ APP = FastAPI(
 def health() -> HealthResponse:
     """Verifies infrastructure integrity state and model deployment metrics."""
     with MODEL_LOCK:
-        ready = trainer_instance is not None
-        trained = last_trained_at.isoformat() if last_trained_at else None
+        ready = TRAINER_INSTANCE is not None
+        trained = LAST_TRAINED_AT.isoformat() if LAST_TRAINED_AT else None
 
     if not ready:
         raise HTTPException(
@@ -314,7 +264,6 @@ def health() -> HealthResponse:
     )
 
 
-# pylint: disable=R0914
 @APP.post(
     "/predict",
     response_model=PredictionResponse,
@@ -322,39 +271,27 @@ def health() -> HealthResponse:
     tags=["Predictions"],
 )
 def predict(request: PredictionRequest) -> PredictionResponse:
-    """Generates structured target predictions supplemented with driver profile metrics.
-
-    Evaluates localized node arrays to output optimized vacancy indexes.
-    """
-    # 1. Temporal extraction execution over validated payload attributes
+    """Generates structured target predictions supplemented with driver profile metrics."""
     time_stamp = request.timestamp
     hour = time_stamp.hour
-    day_of_week = time_stamp.isoweekday()  # Monday=1 ... Sunday=7 layout
+    day_of_week = time_stamp.isoweekday()
     month = time_stamp.month
 
     LOGGER.info(
-        "Prediction demand | Target Node: %s |\n"
-        "Temporal marker: %s |\n"
-        "Routing depth criteria: %s |\n"
-        "Context metrics: H:%s DOW:%s M:%s",
+        "Prediction demand | Node: %s | Time: %s | Profile: %s",
         request.road_segment_id,
         time_stamp.isoformat(),
         request.driver_profile,
-        hour,
-        day_of_week,
-        month,
     )
 
-    # 2. Extract stable runtime reference variables using lock managers
     with MODEL_LOCK:
-        trainer = trainer_instance
-        hist_profiles = historical_prof
+        trainer = TRAINER_INSTANCE
+        hist_profiles = HISTORICAL_PROF
 
     if trainer is None or hist_profiles is None:
         raise HTTPException(status_code=503, detail="Engine arrays are undergoing refresh loops.")
 
     try:
-        # 3. Assemble full dimensional inference tracking maps
         all_segments_df: DataFrame = hist_profiles.select("road_segment_id").distinct()
 
         inference_df: DataFrame = (
@@ -364,32 +301,30 @@ def predict(request: PredictionRequest) -> PredictionResponse:
             .withColumn("month", F.lit(month))
         )
 
-        inference_df = (
-            inference_df.withColumn("tempC", F.lit(21))
-            .withColumn("windspeedKmph", F.lit(12))
-            .withColumn("precipMM", F.lit(0.0))
-            .withColumn("commercial", F.lit(1.0))
-            .withColumn("residential", F.lit(1.0))
-            .withColumn("schools", F.lit(0.0))
-            .withColumn("shopping", F.lit(0.0))
-            .withColumn("office", F.lit(0.0))
-            .withColumn("supermarket", F.lit(0.0))
-            .withColumn("restaurant", F.lit(0.0))
-            .withColumn("eventsites", F.lit(0.0))
-            .withColumn("transportation", F.lit(0.0))
-            .withColumn("off_street_capa", F.lit(50.0))
-            .withColumn("num_off_street_parking", F.lit(1.0))
-        )
+        static_features: Dict[str, Any] = {
+            "tempC": 21,
+            "windspeedKmph": 12,
+            "precipMM": 0.0,
+            "commercial": 1.0,
+            "residential": 1.0,
+            "schools": 0.0,
+            "shopping": 0.0,
+            "office": 0.0,
+            "supermarket": 0.0,
+            "restaurant": 0.0,
+            "eventsites": 0.0,
+            "transportation": 0.0,
+            "off_street_capa": 50.0,
+            "num_off_street_parking": 1.0,
+        }
+        for col_name, value in static_features.items():
+            inference_df = inference_df.withColumn(col_name, F.lit(value))
 
-        # Enrich vector maps against historical records using target values
         inference_df = inference_df.join(
             hist_profiles, on=["road_segment_id", "hour", "day_of_week"], how="left"
         ).na.fill(value=0.5, subset=["historical_occupancy_ratio"])
 
-        # 4. Process dataframe matrices via trained estimator pot
         results_df: DataFrame = trainer.predict_probabilities(inference_df, LOGGER)
-
-        # 5. Extract prediction rows mapping specified client requirements
         target_rows = results_df.filter(
             F.col("road_segment_id") == request.road_segment_id
         ).collect()
@@ -397,20 +332,15 @@ def predict(request: PredictionRequest) -> PredictionResponse:
         if not target_rows:
             raise HTTPException(
                 status_code=404,
-                detail=f"""Specified location entity '{request.road_segment_id}'
-                  is unknown inside matrix models.""",
+                detail=f"Specified location entity '{request.road_segment_id}' is unknown.",
             )
 
         target_probability = round(float(target_rows[0]["occupancy_probability"]), 4)
-
-        # 6. Compile sorted replacement pathways according to depth profiles
         top_alternatives: Optional[List[AlternativeSegment]] = None
 
-        if request.driver_profile in (DriverProfile.active, DriverProfile.standard):
-            top_n = 10 if request.driver_profile == DriverProfile.active else 5
+        if request.driver_profile in (DriverProfile.ACTIVE, DriverProfile.STANDARD):
+            top_n = 10 if request.driver_profile == DriverProfile.ACTIVE else 5
 
-            # Rank candidate entities based on relative vacancy
-            #  (lowest saturation maps optimal status)
             alt_rows = (
                 results_df.filter(F.col("road_segment_id") != request.road_segment_id)
                 .orderBy(F.col("occupancy_probability").asc())
@@ -427,7 +357,6 @@ def predict(request: PredictionRequest) -> PredictionResponse:
                 for row in alt_rows
             ]
 
-        # 7. Deliver validated, serialized data records back across transport networks
         return PredictionResponse(
             road_segment_id=request.road_segment_id,
             timestamp=request.timestamp,
@@ -437,7 +366,7 @@ def predict(request: PredictionRequest) -> PredictionResponse:
         )
 
     except HTTPException:
-        raise  # Pass explicitly recognized validation and domain breaks unmolested
+        raise
     except Exception as exc:
         LOGGER.error("Inference execution sequence broke down: %s", exc, exc_info=True)
         raise HTTPException(
@@ -445,9 +374,6 @@ def predict(request: PredictionRequest) -> PredictionResponse:
         )
 
 
-# ---------------------------------------------------------------------------
-# CORE APPLICATION LAUNCH PAD
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     uvicorn.run(
         "api:APP",
