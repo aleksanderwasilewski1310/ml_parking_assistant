@@ -16,7 +16,7 @@ import threading
 from contextlib import asynccontextmanager  # pylint: disable=no-name-in-module
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -47,14 +47,21 @@ DATA_PATHS: Dict[str, str] = {
 
 RETRAIN_INTERVAL_SECONDS: int = 3600
 
+
 # --- Thread-Safe Global Environment State ---
+class EngineState:
+    def __init__(self):
+        self.trainer: Optional[object] = None
+        self.historical_profiles: Optional[object] = None
+        self.last_trained_at: Optional[datetime] = None
+
+
 MODEL_LOCK = threading.Lock()
-TRAINER_INSTANCE: Optional[ParkingModelTrainer] = None
-HISTORICAL_PROF: Optional[DataFrame] = None
-LAST_TRAINED_AT: Optional[datetime] = None
+STATE = EngineState()
 
 
 # --- Data Validation Schemas (Pydantic V2) ---
+# pylint: disable=too-few-public-methods
 class DriverProfile(str, Enum):
     """Supported telemetry routing depth criteria profiles."""
 
@@ -69,12 +76,12 @@ class PredictionRequest(BaseModel):
     road_segment_id: str = Field(
         ...,
         description="Unique database identifier of the target road segment.",
-        examples=["SEG_001"],
+        examples=["21976"],
     )
     timestamp: datetime = Field(
         ...,
         description="ISO-8601 compliant datetime stamp for the prediction instance.",
-        examples=["2026-07-03T15:30:00"],
+        examples=["2026-07-03T08:30:00"],
     )
     driver_profile: DriverProfile = Field(
         default=DriverProfile.INACTIVE,
@@ -115,11 +122,7 @@ class HealthResponse(BaseModel):
 
 # --- Model Pipeline Processing Core ---
 def _load_and_train() -> None:
-    """Reads transactional data, constructs features, and fits ML pipelines.
-
-    Uses safe global synchronization primitives to update active runtime variables.
-    """
-    global TRAINER_INSTANCE, HISTORICAL_PROF, LAST_TRAINED_AT
+    """Reads transactional data, constructs features, and fits ML pipelines."""
 
     LOGGER.info("Initiating model training loop and temporal matrix generation...")
 
@@ -147,24 +150,24 @@ def _load_and_train() -> None:
         trainer.get_feature_importance(LOGGER)
 
         with MODEL_LOCK:
-            TRAINER_INSTANCE = trainer
-            HISTORICAL_PROF = historical_profiles
-            LAST_TRAINED_AT = datetime.now(timezone.utc)
+            STATE.trainer = trainer
+            STATE.historical_profiles = historical_profiles
+            STATE.last_trained_at = datetime.now(timezone.utc)
 
-            is_empty = HISTORICAL_PROF.isEmpty() if HISTORICAL_PROF else True
+            is_empty = STATE.historical_profiles.isEmpty() if STATE.historical_profiles else True
             LOGGER.info(
                 "Thread-bound context updated safely. Trainer object: %s | "
                 "Profiles loaded successfully: %s | Timestamp: %s",
-                type(TRAINER_INSTANCE).__name__,
+                type(STATE.trainer).__name__,
                 "NO (Empty)" if is_empty else "YES (Active)",
-                LAST_TRAINED_AT.isoformat(),
+                STATE.last_trained_at.isoformat(),
             )
 
     except AnalysisException as spark_exc:
         LOGGER.error("Spark engine calculation failed: %s", spark_exc, exc_info=True)
     except OSError as io_exc:
         LOGGER.error("File system reading or caching breakdown: %s", io_exc, exc_info=True)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
+    except Exception as exc:
         LOGGER.error("Unexpected failure in pipeline execution: %s", exc, exc_info=True)
 
 
@@ -208,7 +211,7 @@ async def lifespan(app: FastAPI):
     LOGGER.info("Pre-warming model analytics arrays prior to interface exposing...")
     _load_and_train()
 
-    if TRAINER_INSTANCE is None:
+    if STATE.trainer is None:
         LOGGER.critical("Initial training sequence collapsed. Secure boot failed.")
         raise RuntimeError("Prerequisite component building crashed during startup layer.")
 
@@ -223,8 +226,8 @@ async def lifespan(app: FastAPI):
     yield
 
     LOGGER.info("Intercepted teardown invocation. Disengaging cluster engine links...")
-    if HISTORICAL_PROF is not None:
-        HISTORICAL_PROF.unpersist()
+    if STATE.historical_profiles is not None:
+        STATE.historical_profiles.unpersist()
     if app.state.spark:
         app.state.spark.stop()
     LOGGER.info("API cluster termination processes successfully closed down.")
@@ -239,6 +242,42 @@ APP = FastAPI(
 
 
 # --- REST Endpoints Layer ---
+def _prepare_inference_dataframe(hist_profiles: DataFrame, time_stamp: datetime) -> DataFrame:
+    """Constructs the full feature matrix required by the ML model for inference."""
+    all_segments_df = hist_profiles.select("road_segment_id").distinct()
+
+    inference_df = (
+        all_segments_df.withColumn("timestamp", F.lit(time_stamp.isoformat()).cast("timestamp"))
+        .withColumn("hour", F.lit(time_stamp.hour))
+        .withColumn("day_of_week", F.lit(time_stamp.isoweekday()))
+        .withColumn("month", F.lit(time_stamp.month))
+    )
+
+    static_features = {
+        "tempC": 21,
+        "windspeedKmph": 12,
+        "precipMM": 0.0,
+        "commercial": 1.0,
+        "residential": 1.0,
+        "schools": 0.0,
+        "shopping": 0.0,
+        "office": 0.0,
+        "supermarket": 0.0,
+        "restaurant": 0.0,
+        "eventsites": 0.0,
+        "transportation": 0.0,
+        "off_street_capa": 50.0,
+        "num_off_street_parking": 1.0,
+    }
+
+    for col_name, value in static_features.items():
+        inference_df = inference_df.withColumn(col_name, F.lit(value))
+
+    return inference_df.join(
+        hist_profiles, on=["road_segment_id", "hour", "day_of_week"], how="left"
+    ).na.fill(value=0.5, subset=["historical_occupancy_ratio"])
+
+
 @APP.get(
     "/health",
     response_model=HealthResponse,
@@ -248,8 +287,8 @@ APP = FastAPI(
 def health() -> HealthResponse:
     """Verifies infrastructure integrity state and model deployment metrics."""
     with MODEL_LOCK:
-        ready = TRAINER_INSTANCE is not None
-        trained = LAST_TRAINED_AT.isoformat() if LAST_TRAINED_AT else None
+        ready = STATE.trainer is not None
+        trained = STATE.last_trained_at.isoformat() if STATE.last_trained_at else None
 
     if not ready:
         raise HTTPException(
@@ -272,59 +311,24 @@ def health() -> HealthResponse:
 )
 def predict(request: PredictionRequest) -> PredictionResponse:
     """Generates structured target predictions supplemented with driver profile metrics."""
-    time_stamp = request.timestamp
-    hour = time_stamp.hour
-    day_of_week = time_stamp.isoweekday()
-    month = time_stamp.month
-
     LOGGER.info(
         "Prediction demand | Node: %s | Time: %s | Profile: %s",
         request.road_segment_id,
-        time_stamp.isoformat(),
+        request.timestamp.isoformat(),
         request.driver_profile,
     )
 
     with MODEL_LOCK:
-        trainer = TRAINER_INSTANCE
-        hist_profiles = HISTORICAL_PROF
+        trainer = STATE.trainer
+        hist_profiles = STATE.historical_profiles
 
     if trainer is None or hist_profiles is None:
         raise HTTPException(status_code=503, detail="Engine arrays are undergoing refresh loops.")
 
     try:
-        all_segments_df: DataFrame = hist_profiles.select("road_segment_id").distinct()
+        inference_df = _prepare_inference_dataframe(hist_profiles, request.timestamp)
+        results_df = trainer.predict_probabilities(inference_df, LOGGER)
 
-        inference_df: DataFrame = (
-            all_segments_df.withColumn("timestamp", F.lit(time_stamp.isoformat()).cast("timestamp"))
-            .withColumn("hour", F.lit(hour))
-            .withColumn("day_of_week", F.lit(day_of_week))
-            .withColumn("month", F.lit(month))
-        )
-
-        static_features: Dict[str, Any] = {
-            "tempC": 21,
-            "windspeedKmph": 12,
-            "precipMM": 0.0,
-            "commercial": 1.0,
-            "residential": 1.0,
-            "schools": 0.0,
-            "shopping": 0.0,
-            "office": 0.0,
-            "supermarket": 0.0,
-            "restaurant": 0.0,
-            "eventsites": 0.0,
-            "transportation": 0.0,
-            "off_street_capa": 50.0,
-            "num_off_street_parking": 1.0,
-        }
-        for col_name, value in static_features.items():
-            inference_df = inference_df.withColumn(col_name, F.lit(value))
-
-        inference_df = inference_df.join(
-            hist_profiles, on=["road_segment_id", "hour", "day_of_week"], how="left"
-        ).na.fill(value=0.5, subset=["historical_occupancy_ratio"])
-
-        results_df: DataFrame = trainer.predict_probabilities(inference_df, LOGGER)
         target_rows = results_df.filter(
             F.col("road_segment_id") == request.road_segment_id
         ).collect()
