@@ -128,9 +128,9 @@ class HealthResponse(BaseModel):
 # THREAD-SAFE GLOBAL IN-MEMORY ENVIRONMENT STATE
 # ---------------------------------------------------------------------------
 MODEL_LOCK = threading.Lock()
-TRAINER: Optional[ParkingModelTrainer] = None
-HISTORICAL_PROFILES: Optional[DataFrame] = None
-LAST_TRAINED_AT: Optional[datetime] = None
+trainer_instance: Optional[ParkingModelTrainer] = None
+historical_prof: Optional[DataFrame] = None
+last_trained_at: Optional[datetime] = None
 
 # ---------------------------------------------------------------------------
 # MODEL PIPELINE PROCESSING CORE
@@ -175,20 +175,20 @@ def _load_and_train() -> None:
 
         # 6. Secure critical resource execution via single thread-bound context block
         with MODEL_LOCK:
-            TRAINER = trainer  # pylint: disable=W0612
-            HISTORICAL_PROFILES = historical_profiles
-            LAST_TRAINED_AT = datetime.now(timezone.utc)
+            trainer_instance = trainer
+            historical_prof = historical_profiles
+            last_trained_at = datetime.now(timezone.utc)
             LOGGER.info(
                 "Thread-bound context updated safely. Trainer object: %s | "
                 "Loaded historical profiles count: %s | Timestamp: %s",
-                type(TRAINER).__name__,
-                len(HISTORICAL_PROFILES) if HISTORICAL_PROFILES else 0,
-                LAST_TRAINED_AT.isoformat(),
+                type(trainer_instance).__name__,
+                len(historical_prof) if historical_prof else 0,
+                last_trained_at.isoformat(),
             )
 
-        LOGGER.info("Model update successfully executed at %s", LAST_TRAINED_AT.isoformat())
+        LOGGER.info("Model update successfully executed at %s", last_trained_at.isoformat())
 
-    except Exception as exc:
+    except Exception as exc:  # pylint: disable=broad-exception-caught
         LOGGER.error(
             "Execution failed on background context assembly pipeline: %s",
             exc,
@@ -247,7 +247,7 @@ async def lifespan(app: FastAPI):
     LOGGER.info("Pre-warming model analytics arrays prior to interface exposing...")
     _load_and_train()
 
-    if TRAINER is None:
+    if trainer_instance is None:
         LOGGER.critical(
             "Initial training sequence collapsed. Service framework cannot boot securely."
         )
@@ -266,8 +266,8 @@ async def lifespan(app: FastAPI):
     # -- SHUTDOWN SEQUENCE ---------------------------------------------------
     LOGGER.info("Intercepted teardown invocation. Disengaging cluster engine links...")
 
-    if HISTORICAL_PROFILES is not None:
-        HISTORICAL_PROFILES.unpersist()
+    if historical_prof is not None:
+        historical_prof.unpersist()
     if app.state.spark:
         app.state.spark.stop()
     LOGGER.info("API cluster termination processes successfully closed down.")
@@ -298,8 +298,8 @@ APP = FastAPI(
 def health() -> HealthResponse:
     """Verifies infrastructure integrity state and model deployment metrics."""
     with MODEL_LOCK:
-        ready = TRAINER is not None
-        trained = LAST_TRAINED_AT.isoformat() if LAST_TRAINED_AT else None
+        ready = trainer_instance is not None
+        trained = last_trained_at.isoformat() if last_trained_at else None
 
     if not ready:
         raise HTTPException(
@@ -347,8 +347,8 @@ def predict(request: PredictionRequest) -> PredictionResponse:
 
     # 2. Extract stable runtime reference variables using lock managers
     with MODEL_LOCK:
-        trainer = TRAINER
-        hist_profiles = HISTORICAL_PROFILES
+        trainer = trainer_instance
+        hist_profiles = historical_prof
 
     if trainer is None or hist_profiles is None:
         raise HTTPException(status_code=503, detail="Engine arrays are undergoing refresh loops.")
