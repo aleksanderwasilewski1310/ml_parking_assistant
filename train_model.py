@@ -14,14 +14,28 @@ from pyspark.sql.dataframe import DataFrame
 
 
 class ParkingModelTrainer:
+    """A trainer wrapper managing the PySpark ML Random Forest pipeline lifecycle.
+
+    This class handles feature engineering, orchestration of the Spark pipeline
+    (VectorAssembler and RandomForestClassifier), metrics evaluation, model saving,
+    and extraction of real-time prediction probabilities for parking segment occupancy.
+
+    Attributes:
+        model (PipelineModel, optional): The fitted PySpark Pipeline object containing
+            the transformation stages and the trained classifier. Defaults to None.
+        is_trained (bool): Operational flag indicating whether the model pipeline
+            has been successfully fit on training data. Defaults to False.
+    """
+
     def __init__(self):
         self.model = None
         self.is_trained = False
 
-    def prepare_features(self, df: DataFrame) -> DataFrame:
+    @staticmethod
+    def prepare_features(df_data: DataFrame) -> DataFrame:
         """Extracts temporal features from the timestamp column."""
         return (
-            df.withColumn("hour", F.hour(F.col("timestamp")))
+            df_data.withColumn("hour", F.hour(F.col("timestamp")))
             .withColumn("day_of_week", F.dayofweek(F.col("timestamp")))
             .withColumn("month", F.month(F.col("timestamp")))
         )
@@ -62,7 +76,7 @@ class ParkingModelTrainer:
         # 2. Define the Random Forest Classifier
         # numTrees: 100 for ensemble stability and generalization
         # maxDepth: 10 allows trees to split on both historical averages and weather tweaks
-        rf = RandomForestClassifier(
+        rf_classifier = RandomForestClassifier(
             featuresCol="features",
             labelCol="is_occupied",
             probabilityCol="probability",
@@ -72,7 +86,7 @@ class ParkingModelTrainer:
         )
 
         # 3. Chain stages into the Pipeline (Assembler -> Classifier)
-        pipeline = Pipeline(stages=[assembler, rf])
+        pipeline = Pipeline(stages=[assembler, rf_classifier])
 
         logger.info("Fitting the Random Forest Pipeline on training data...")
         self.model = pipeline.fit(train_df)
@@ -165,16 +179,17 @@ class ParkingModelTrainer:
 
             return sorted_importance
 
-        except Exception as e:
+        except Exception as error:
             if logger:
-                logger.error(f"Failed to extract feature importance: {str(e)}")
-            raise e
+                logger.error(f"Failed to extract feature importance: {str(error)}")
+            raise error
 
 
 def train_and_predict_pipeline(
     processed_df: DataFrame, logger: logging.Logger
 ) -> DataFrame:
-    """Orchestration function with advanced historical target encoding (Segment + Hour + Day of Week)
+    """Orchestration function with advanced historical target encoding
+      (Segment + Hour + Day of Week)
 
     and strict separation to prevent data leakage.
     """

@@ -85,6 +85,7 @@ class PredictionRequest(BaseModel):
     )
 
 
+# pylint: disable=too-few-public-methods
 class AlternativeSegment(BaseModel):
     """A granular alternative parking node prediction matrix output."""
 
@@ -92,6 +93,7 @@ class AlternativeSegment(BaseModel):
     occupancy_probability: float
 
 
+# pylint: disable=too-few-public-methods
 class PredictionResponse(BaseModel):
     """Outbound prediction response contract transmitted back to client nodes."""
 
@@ -104,10 +106,12 @@ class PredictionResponse(BaseModel):
     )
     top_alternatives: Optional[List[AlternativeSegment]] = Field(
         default=None,
-        description="Ranked list of contextually optimized alternatives (active: top 10, standard: top 5).",
+        description="""Ranked list of contextually optimized alternatives
+          (active: top 10, standard: top 5).""",
     )
 
 
+# pylint: disable=too-few-public-methods
 class HealthResponse(BaseModel):
     """Monitoring schema mapping the infrastructure vital components."""
 
@@ -120,9 +124,9 @@ class HealthResponse(BaseModel):
 # THREAD-SAFE GLOBAL IN-MEMORY ENVIRONMENT STATE
 # ---------------------------------------------------------------------------
 _model_lock = threading.Lock()
-_trainer: Optional[ParkingModelTrainer] = None
-_historical_profiles: Optional[DataFrame] = None
-_last_trained_at: Optional[datetime] = None
+_TRAINER: Optional[ParkingModelTrainer] = None
+_HISTORICAL_PROFILES: Optional[DataFrame] = None
+_LAST_TRAINED_AT: Optional[datetime] = None
 
 # ---------------------------------------------------------------------------
 # MODEL PIPELINE PROCESSING CORE
@@ -134,7 +138,7 @@ def _load_and_train() -> None:
 
     target encodings, fits pipelines, and executes hot-swaps under atomic guards.
     """
-    global _trainer, _historical_profiles, _last_trained_at
+    global _TRAINER, _HISTORICAL_PROFILES, _LAST_TRAINED_AT
 
     LOGGER.info("Initiating model training loop and temporal matrix generation...")
 
@@ -168,12 +172,12 @@ def _load_and_train() -> None:
 
         # 6. Secure critical resource execution via single thread-bound context block
         with _model_lock:
-            _trainer = trainer
-            _historical_profiles = historical_profiles
-            _last_trained_at = datetime.now(timezone.utc)
+            _TRAINER = trainer
+            _HISTORICAL_PROFILES = historical_profiles
+            _LAST_TRAINED_AT = datetime.now(timezone.utc)
 
         LOGGER.info(
-            f"Model update successfully executed at {_last_trained_at.isoformat()}"
+            f"Model update successfully executed at {_LAST_TRAINED_AT.isoformat()}"
         )
 
     except Exception as exc:
@@ -236,7 +240,7 @@ async def lifespan(app: FastAPI):
     LOGGER.info("Pre-warming model analytics arrays prior to interface exposing...")
     _load_and_train()
 
-    if _trainer is None:
+    if _TRAINER is None:
         LOGGER.critical(
             "Initial training sequence collapsed. Service framework cannot boot securely."
         )
@@ -258,9 +262,9 @@ async def lifespan(app: FastAPI):
 
     # -- SHUTDOWN SEQUENCE ---------------------------------------------------
     LOGGER.info("Intercepted teardown invocation. Disengaging cluster engine links...")
-    global _historical_profiles
-    if _historical_profiles is not None:
-        _historical_profiles.unpersist()
+    global _HISTORICAL_PROFILES
+    if _HISTORICAL_PROFILES is not None:
+        _HISTORICAL_PROFILES.unpersist()
     if spark:
         spark.stop()
     LOGGER.info("API cluster termination processes successfully closed down.")
@@ -291,8 +295,8 @@ app = FastAPI(
 def health() -> HealthResponse:
     """Verifies infrastructure integrity state and model deployment metrics."""
     with _model_lock:
-        ready = _trainer is not None
-        trained = _last_trained_at.isoformat() if _last_trained_at else None
+        ready = _TRAINER is not None
+        trained = _LAST_TRAINED_AT.isoformat() if _LAST_TRAINED_AT else None
 
     if not ready:
         raise HTTPException(
@@ -325,14 +329,16 @@ def predict(request: PredictionRequest) -> PredictionResponse:
     month = ts.month
 
     LOGGER.info(
-        f"Prediction demand | Target Node: {request.road_segment_id} | Temporal marker: {ts.isoformat()} "
-        f"| Routing depth criteria: {request.driver_profile} | Context metrics: H:{hour} DOW:{day_of_week} M:{month}"
+        f"""Prediction demand | Target Node: {request.road_segment_id} |
+          Temporal marker: {ts.isoformat()} """
+        f"""| Routing depth criteria: {request.driver_profile} |
+          Context metrics: H:{hour} DOW:{day_of_week} M:{month}"""
     )
 
     # 2. Extract stable runtime reference variables using lock managers
     with _model_lock:
-        trainer = _trainer
-        hist_profiles = _historical_profiles
+        trainer = _TRAINER
+        hist_profiles = _HISTORICAL_PROFILES
 
     if trainer is None or hist_profiles is None:
         raise HTTPException(
