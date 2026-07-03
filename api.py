@@ -29,6 +29,7 @@ import pyspark.sql.functions as F
 from read_data import create_dataframe
 from train_model import ParkingModelTrainer
 # pylint: enable=import-error
+# pylint: disable=broad-exception-caught
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -49,7 +50,11 @@ RETRAIN_INTERVAL_SECONDS: int = 3600
 
 
 # --- Thread-Safe Global Environment State ---
+# pylint: disable=too-few-public-methods
 class EngineState:
+    """Manages the active machine learning model artifacts
+    and execution state at runtime."""
+
     def __init__(self):
         self.trainer: Optional[object] = None
         self.historical_profiles: Optional[object] = None
@@ -375,7 +380,7 @@ def predict(request: PredictionRequest) -> PredictionResponse:
         LOGGER.error("Inference execution sequence broke down: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=500, detail="Core server encountered transformation issues."
-        )
+        ) from exc
 
 
 if __name__ == "__main__":
