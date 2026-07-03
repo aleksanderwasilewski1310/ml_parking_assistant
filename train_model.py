@@ -42,13 +42,9 @@ class ParkingModelTrainer:
             .withColumn("month", F.month(F.col("timestamp")))
         )
 
-    def build_and_train_pipeline(
-        self, train_df: DataFrame, logger: logging.Logger
-    ) -> None:
+    def build_and_train_pipeline(self, train_df: DataFrame, logger: logging.Logger) -> None:
         """Builds the MLlib Pipeline with Random Forest and trains the model."""
-        logger.info(
-            "Building the Random Forest ML pipeline with historical target encoding..."
-        )
+        logger.info("Building the Random Forest ML pipeline with historical target encoding...")
 
         # 1. Assemble independent variables into a single feature vector.
         # We drop raw segment IDs and use the continuous 'historical_occupancy_ratio'
@@ -111,14 +107,10 @@ class ParkingModelTrainer:
         auc = evaluator.evaluate(predictions)
         return auc
 
-    def predict_probabilities(
-        self, inference_df: DataFrame, logger: logging.Logger
-    ) -> DataFrame:
+    def predict_probabilities(self, inference_df: DataFrame, logger: logging.Logger) -> DataFrame:
         """Predicts occupancy probabilities using native Spark transformations."""
         if not self.is_trained:
-            raise ValueError(
-                "Model must be trained before making inference predictions."
-            )
+            raise ValueError("Model must be trained before making inference predictions.")
 
         logger.info("Calculating parking occupancy probabilities with Random Forest...")
 
@@ -187,9 +179,7 @@ class ParkingModelTrainer:
             raise error
 
 
-def train_and_predict_pipeline(
-    processed_df: DataFrame, logger: logging.Logger
-) -> DataFrame:
+def train_and_predict_pipeline(processed_df: DataFrame, logger: logging.Logger) -> DataFrame:
     """Orchestration function with advanced historical target encoding
       (Segment + Hour + Day of Week)
 
@@ -214,9 +204,9 @@ def train_and_predict_pipeline(
     logger.info(
         "Computing granular historical occupancy profiles (Segment + Hour + Day of Week)..."
     )
-    historical_profiles = raw_train.groupBy(
-        "road_segment_id", "hour", "day_of_week"
-    ).agg(F.avg("is_occupied").alias("historical_occupancy_ratio"))
+    historical_profiles = raw_train.groupBy("road_segment_id", "hour", "day_of_week").agg(
+        F.avg("is_occupied").alias("historical_occupancy_ratio")
+    )
     historical_profiles.cache()
 
     # 4. JOIN profiles back using the expanded composite key

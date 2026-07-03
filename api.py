@@ -127,10 +127,10 @@ class HealthResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # THREAD-SAFE GLOBAL IN-MEMORY ENVIRONMENT STATE
 # ---------------------------------------------------------------------------
-_MODEL_LOCK = threading.Lock()
-_TRAINER: Optional[ParkingModelTrainer] = None
-_HISTORICAL_PROFILES: Optional[DataFrame] = None
-_LAST_TRAINED_AT: Optional[datetime] = None
+MODEL_LOCK = threading.Lock()
+TRAINER: Optional[ParkingModelTrainer] = None
+HISTORICAL_PROFILES: Optional[DataFrame] = None
+LAST_TRAINED_AT: Optional[datetime] = None
 
 # ---------------------------------------------------------------------------
 # MODEL PIPELINE PROCESSING CORE
@@ -174,14 +174,19 @@ def _load_and_train() -> None:
         trainer.get_feature_importance(LOGGER)
 
         # 6. Secure critical resource execution via single thread-bound context block
-        with _MODEL_LOCK:
-            _TRAINER = trainer
-            _HISTORICAL_PROFILES = historical_profiles
-            _LAST_TRAINED_AT = datetime.now(timezone.utc)
+        with MODEL_LOCK:
+            TRAINER = trainer  # pylint: disable=W0612
+            HISTORICAL_PROFILES = historical_profiles
+            LAST_TRAINED_AT = datetime.now(timezone.utc)
+            LOGGER.info(
+                "Thread-bound context updated safely. Trainer object: %s | "
+                "Loaded historical profiles count: %s | Timestamp: %s",
+                type(TRAINER).__name__,
+                len(HISTORICAL_PROFILES) if HISTORICAL_PROFILES else 0,
+                LAST_TRAINED_AT.isoformat(),
+            )
 
-        LOGGER.info(
-            f"Model update successfully executed at {_LAST_TRAINED_AT.isoformat()}"
-        )
+        LOGGER.info("Model update successfully executed at %s", LAST_TRAINED_AT.isoformat())
 
     except Exception as exc:
         LOGGER.error(
@@ -217,9 +222,7 @@ async def lifespan(app: FastAPI):
     Enforces python execution path parity for secondary PySpark context allocation workers.
     """
     # -- STARTUP SEQUENCE ----------------------------------------------------
-    LOGGER.info(
-        "Warming local operating kernel context. Building PySpark Session context..."
-    )
+    LOGGER.info("Warming local operating kernel context. Building PySpark Session context...")
 
     # WINDOWS ENVIRONMENT STABILITY CURE: Enforce workers to bind to virtual env paths explicitly
     os.environ["PYSPARK_PYTHON"] = sys.executable
@@ -244,13 +247,11 @@ async def lifespan(app: FastAPI):
     LOGGER.info("Pre-warming model analytics arrays prior to interface exposing...")
     _load_and_train()
 
-    if _TRAINER is None:
+    if TRAINER is None:
         LOGGER.critical(
             "Initial training sequence collapsed. Service framework cannot boot securely."
         )
-        raise RuntimeError(
-            "Prerequisite component building crashed during startup layer."
-        )
+        raise RuntimeError("Prerequisite component building crashed during startup layer.")
 
     retrainer_thread = threading.Thread(
         target=_schedule_retraining,
@@ -258,17 +259,15 @@ async def lifespan(app: FastAPI):
         daemon=True,
     )
     retrainer_thread.start()
-    LOGGER.info(
-        "Subprocess daemon 'ModelRetrainer' safely assigned to execution queue."
-    )
+    LOGGER.info("Subprocess daemon 'ModelRetrainer' safely assigned to execution queue.")
 
     yield  # Handover execution control back to web engine context loop
 
     # -- SHUTDOWN SEQUENCE ---------------------------------------------------
     LOGGER.info("Intercepted teardown invocation. Disengaging cluster engine links...")
 
-    if _HISTORICAL_PROFILES is not None:
-        _HISTORICAL_PROFILES.unpersist()
+    if HISTORICAL_PROFILES is not None:
+        HISTORICAL_PROFILES.unpersist()
     if app.state.spark:
         app.state.spark.stop()
     LOGGER.info("API cluster termination processes successfully closed down.")
@@ -298,9 +297,9 @@ APP = FastAPI(
 )
 def health() -> HealthResponse:
     """Verifies infrastructure integrity state and model deployment metrics."""
-    with _MODEL_LOCK:
-        ready = _TRAINER is not None
-        trained = _LAST_TRAINED_AT.isoformat() if _LAST_TRAINED_AT else None
+    with MODEL_LOCK:
+        ready = TRAINER is not None
+        trained = LAST_TRAINED_AT.isoformat() if LAST_TRAINED_AT else None
 
     if not ready:
         raise HTTPException(
@@ -347,23 +346,19 @@ def predict(request: PredictionRequest) -> PredictionResponse:
     )
 
     # 2. Extract stable runtime reference variables using lock managers
-    with _MODEL_LOCK:
-        trainer = _TRAINER
-        hist_profiles = _HISTORICAL_PROFILES
+    with MODEL_LOCK:
+        trainer = TRAINER
+        hist_profiles = HISTORICAL_PROFILES
 
     if trainer is None or hist_profiles is None:
-        raise HTTPException(
-            status_code=503, detail="Engine arrays are undergoing refresh loops."
-        )
+        raise HTTPException(status_code=503, detail="Engine arrays are undergoing refresh loops.")
 
     try:
         # 3. Assemble full dimensional inference tracking maps
         all_segments_df: DataFrame = hist_profiles.select("road_segment_id").distinct()
 
         inference_df: DataFrame = (
-            all_segments_df.withColumn(
-                "timestamp", F.lit(time_stamp.isoformat()).cast("timestamp")
-            )
+            all_segments_df.withColumn("timestamp", F.lit(time_stamp.isoformat()).cast("timestamp"))
             .withColumn("hour", F.lit(hour))
             .withColumn("day_of_week", F.lit(day_of_week))
             .withColumn("month", F.lit(month))

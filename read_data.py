@@ -45,9 +45,7 @@ class ReadFile:
         try:
             logger.info(f"Attempting to load file: {path}")
             # Load CSV data
-            self.data = SPARK.read.csv(
-                path, header=True, inferSchema=True, nullValue="null"
-            )
+            self.data = SPARK.read.csv(path, header=True, inferSchema=True, nullValue="null")
 
         except AnalysisException as error:
             logger.error(
@@ -55,9 +53,7 @@ class ReadFile:
             )
             raise  # Rerun the exception to halt the pipeline execution immediately
         except Exception as error:
-            logger.error(
-                f"An unexpected error occurred while reading '{path}': {error}"
-            )
+            logger.error(f"An unexpected error occurred while reading '{path}': {error}")
             raise
 
     def clean_data(self, logger):
