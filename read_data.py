@@ -2,6 +2,7 @@
 
 # pylint: disable=import-error
 import logging
+import pyspark.sql.functions as F
 from pyspark.sql import SparkSession
 from pyspark.sql.dataframe import DataFrame
 from pyspark.errors import AnalysisException
@@ -96,6 +97,16 @@ def create_dataframe(data_paths: dict, logger: logging.getLogger) -> DataFrame:
     groundtruth_data.clean_data(logger)
     road_features_data.clean_data(logger)
     weather_data.clean_data(logger)
+
+    # Specific filters:
+    weather_data.data = weather_data.data.filter((F.col("tempC") > -20) & (F.col("tempC") < 50))
+
+    groundtruth_data.data = groundtruth_data.data.filter(
+        (F.col("occupied") >= 0)
+        & (F.col("available") >= 0)
+        & (F.col("occupied") <= F.col("max_capacity"))
+        & (F.col("available") <= F.col("max_capacity"))
+    )
 
     # First join: Merge telemetry with static road features using 'road_segment_id'
     groundtruth_data.data = groundtruth_data.data.join(
